@@ -1,3 +1,27 @@
+/**
+ * 漫画1234 漫画源（Venera）—— 修复版
+ *
+ * 为什么原来的脚本不能用了：
+ *   原脚本依赖 b.amh1234.com 这套旧版 CMS。该域名已经过期并被停放，
+ *   现在 302 到 ww17.amh1234.com 再跳到广告页，同族的 mh1234.com /
+ *   ymh1234.com / gmh1234.com 也全部失效。站点本体已经整体迁移到
+ *   wmh1234.com 的移动端模板（mint），旧的选择器（div.imgBox /
+ *   li.list-comic / #total-page / .chapter-warp / var chapterImages）
+ *   在现站上一个都不存在，所以只能按新模板重写。
+ *
+ * 现站结构：
+ *   - 首页 /            推荐位 .mint-feature、更新 .mint-update-card、发现 .mint-cover-card
+ *   - 分类 /category    可叠加 /tags/{id} /finish/{0,1,2} /order/{hits,id,addtime} /page/{n}
+ *   - 搜索 /search/{kw} 与 /search/{kw}/{n}
+ *   - 详情 /comic/{comicId}.html        章节内联在 .mint-chapter-grid a[data-chapter-id]
+ *   - 阅读 /comic/{cid}/{eid}.html  ->  /go/{token}  ->  reader.hqread.cc/r/{token}
+ *   - 图片 CDN wmh1234.wszwhg.net，直链，无防盗链
+ *
+ * 与原脚本的对应关系：
+ *   explore / category / search / comic.loadInfo / comic.loadEp 一一保留，
+ *   另外补了同族域名自动切换、章节页跳转兜底、图片正则兜底。
+ */
+
 class MH1234 extends ComicSource {
     // name of the source
     name = "漫画1234"
@@ -5,317 +29,584 @@ class MH1234 extends ComicSource {
     // unique id of the source
     key = "mh1234"
 
-    version = "1.0.0"
+    version = "2.0.0"
 
     minAppVersion = "1.4.0"
 
-    // update url
-    url = "https://cdn.jsdelivr.net/gh/venera-app/venera-configs@main/mh1234.js"
+    // update url（自己维护的文件，留空避免被官方旧版覆盖）
+    url = ""
+
+    ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
 
     settings = {
-        domains: {
-            title: "域名",
+        domain: {
+            title: "站点域名",
             type: "input",
-            default: "amh1234.com"
-        }
+            validator: null,
+            default: "m.wmh1234.com",
+        },
+        autoFallback: {
+            title: "域名打不开时自动换备用域名",
+            type: "switch",
+            default: true,
+        },
     }
 
+    /* ============================ 域名与请求 ============================ */
+
+    /** 用户配置的域名，允许带协议头和路径 */
+    get baseHost() {
+        let d = (this.loadSetting("domain") || "").trim()
+        if (d.length === 0) d = "m.wmh1234.com"
+        d = d.replace(/^https?:\/\//i, "")
+        d = d.replace(/\/.*$/, "")
+        return d
+    }
+
+    /** 当前实际使用的地址（自动切换后会缓存在 _host 上） */
     get baseUrl() {
-        return `https://b.${this.loadSetting('domains')}`;
+        const h = this._host
+        return "https://" + (h == null || h.length === 0 ? this.baseHost : h)
     }
 
-    // explore page list
-    explore = [{
-        title: "漫画1234",
-        type: "singlePageWithMultiPart",
-        load: async () => {
-            const result = {};
-            const res = await Network.get(this.baseUrl);
-            if (res.status !== 200) {
-                throw `Invalid status code: ${res.status}`;
-            }
-            const doc = new HtmlDocument(res.body);
-            const mangaLists = doc.querySelectorAll("div.imgBox");
-            for (let list of mangaLists) {
-                const tabTitle = list.querySelector(".Title").text;
-                const items = [];
-                for (let item of list.querySelectorAll("li.list-comic")) {
-                    const info = item.querySelectorAll("a")[1];
-                    items.push(new Comic({
-                        id: item.attributes["data-key"],
-                        title: item.querySelector("a.txtA").text,
-                        cover: item.querySelector("img").attributes["src"]
-                    }));
-                }
-                result[tabTitle] = items;
-            }
-            return result;
+    /** 待尝试的域名列表：缓存域名 -> 用户域名 -> 内置备用域名 */
+    get hosts() {
+        const list = []
+        const add = (h) => {
+            if (h != null && h.length > 0 && list.indexOf(h) < 0) list.push(h)
         }
-    }];
+        add(this._host)
+        add(this.baseHost)
+        if (this.loadSetting("autoFallback") !== false) {
+            add("m.wmh1234.com")
+            add("www.wmh1234.com")
+            add("wmh1234.com")
+        }
+        return list
+    }
 
-    // categories
+    headersFor(host) {
+        return {
+            "User-Agent": this.ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
+            "Referer": "https://" + host + "/",
+        }
+    }
+
+    /**
+     * 取页面 HTML，域名不通时自动换下一个
+     * @param path 以 / 开头的站内路径
+     */
+    async getHtml(path) {
+        let lastError = ""
+        for (let round = 0; round < 2; round++) {
+            const hosts = this.hosts
+            for (const host of hosts) {
+                const url = "https://" + host + path
+                try {
+                    const res = await Network.get(url, this.headersFor(host))
+                    if (res != null && res.status === 200 && res.body != null && res.body.length > 200) {
+                        this._host = host
+                        return res.body
+                    }
+                    lastError = "HTTP " + (res == null ? "?" : res.status)
+                } catch (e) {
+                    lastError = String(e)
+                }
+            }
+        }
+        throw "站点访问失败（" + lastError + "），请到源设置里更换「站点域名」"
+    }
+
+    /**
+     * 取任意地址（阅读页在另一个域名上），带重试
+     * reader.hqread.cc 偶尔会超时，多试几次基本都能过
+     */
+    async getFull(url, referer) {
+        let lastError = ""
+        for (let i = 0; i < 4; i++) {
+            try {
+                const res = await Network.get(url, {
+                    "User-Agent": this.ua,
+                    "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+                    "Accept-Language": "zh-CN,zh;q=0.9",
+                    "Referer": referer == null || referer.length === 0 ? this.baseUrl + "/" : referer,
+                })
+                if (res != null && res.status === 200 && res.body != null && res.body.length > 0) {
+                    return res.body
+                }
+                lastError = "HTTP " + (res == null ? "?" : res.status)
+            } catch (e) {
+                lastError = String(e)
+            }
+        }
+        throw "请求失败（" + lastError + "）：" + url
+    }
+
+    /* ============================ 解析小工具 ============================ */
+
+    textOf(el) {
+        return el == null ? "" : (el.text || "").trim()
+    }
+
+    attrsOf(el, name) {
+        if (el == null) return ""
+        const a = el.attributes
+        return a == null || a[name] == null ? "" : a[name]
+    }
+
+    absUrl(u) {
+        if (u == null) return ""
+        u = u.trim()
+        if (u.length === 0) return ""
+        if (u.startsWith("//")) return "https:" + u
+        if (/^https?:\/\//i.test(u)) return u
+        if (u.startsWith("/")) return this.baseUrl + u
+        return this.baseUrl + "/" + u
+    }
+
+    /** 从 /comic/123.html 或 /comic/123/456.html 中取漫画 id */
+    comicIdOf(href) {
+        const m = (href == null ? "" : href).match(/\/comic\/(\d+)(?:\.html|\/|$)/)
+        return m == null ? null : m[1]
+    }
+
+    coverOf(img) {
+        if (img == null) return ""
+        return this.absUrl(this.attrsOf(img, "data-src") || this.attrsOf(img, "src"))
+    }
+
+    /** 分类 / 搜索 / 更新 / 排行 通用的卡片列表 */
+    parseCards(root) {
+        const comics = []
+        if (root == null) return comics
+        for (const card of root.querySelectorAll(".comic-card")) {
+            const link = card.querySelector("a")
+            const id = this.comicIdOf(this.attrsOf(link, "href"))
+            if (id == null) continue
+            const img = card.querySelector("img")
+            const title = this.textOf(card.querySelector(".comic-card__title")) ||
+                this.attrsOf(img, "alt")
+            comics.push(new Comic({
+                id: id,
+                title: title,
+                subtitle: this.textOf(card.querySelector(".comic-card__chapter")),
+                cover: this.coverOf(img),
+            }))
+        }
+        return comics
+    }
+
+    /** 首页「最新更新」横向卡片 */
+    parseUpdateCards(doc) {
+        const comics = []
+        for (const card of doc.querySelectorAll(".mint-update-card")) {
+            const id = this.comicIdOf(this.attrsOf(card, "href"))
+            if (id == null) continue
+            const img = card.querySelector("img")
+            comics.push(new Comic({
+                id: id,
+                title: this.textOf(card.querySelector("strong")) || this.attrsOf(img, "alt"),
+                subtitle: this.textOf(card.querySelector("small")),
+                cover: this.coverOf(img),
+            }))
+        }
+        return comics
+    }
+
+    /** 首页「发现好故事」封面卡片，也用于详情页的「喜欢这部的也在看」 */
+    parseCoverCards(root, excludeId) {
+        const comics = []
+        if (root == null) return comics
+        for (const card of root.querySelectorAll(".mint-cover-card")) {
+            const id = this.comicIdOf(this.attrsOf(card, "href"))
+            if (id == null) continue
+            if (excludeId != null && id === String(excludeId)) continue
+            const img = card.querySelector("img")
+            const tags = this.textOf(card.querySelector("p")).split(/\s+/).filter(t => t.length > 0)
+            comics.push(new Comic({
+                id: id,
+                title: this.textOf(card.querySelector("h3")) || this.attrsOf(img, "alt"),
+                cover: this.coverOf(img),
+                tags: tags,
+            }))
+        }
+        return comics
+    }
+
+    /** 从分页条「末页」链接取总页数 */
+    maxPageOf(doc) {
+        let max = 1
+        for (const a of doc.querySelectorAll(".pagination-wrapper a")) {
+            const href = this.attrsOf(a, "href")
+            const m = href.match(/\/page\/(\d+)/) || href.match(/\/(\d+)$/)
+            if (m == null) continue
+            const n = parseInt(m[1])
+            if (n > max) max = n
+        }
+        return max
+    }
+
+    /* ============================ 探索页 ============================ */
+
+    explore = [
+        {
+            title: "推荐",
+            type: "multiPartPage",
+            load: async () => {
+                const doc = new HtmlDocument(await this.getHtml("/"))
+                const parts = []
+
+                // 今日推荐（大图位）
+                const feature = doc.querySelector(".mint-feature")
+                if (feature != null) {
+                    const link = feature.querySelector("a.mint-feature__cover")
+                    const id = this.attrsOf(feature, "data-comic-id") ||
+                        this.comicIdOf(this.attrsOf(link, "href"))
+                    if (id != null && id.length > 0) {
+                        const img = feature.querySelector("img")
+                        parts.push({
+                            title: "今日推荐",
+                            comics: [new Comic({
+                                id: id,
+                                title: this.textOf(feature.querySelector("h2")),
+                                cover: this.coverOf(img),
+                                description: this.textOf(feature.querySelector(".mint-feature__description")),
+                            })],
+                        })
+                    }
+                }
+
+                const update = this.parseUpdateCards(doc)
+                if (update.length > 0) parts.push({ title: "最新更新", comics: update })
+
+                const discover = this.parseCoverCards(doc, null)
+                if (discover.length > 0) parts.push({ title: "发现好故事", comics: discover })
+
+                if (parts.length === 0) throw "首页解析为空，站点可能又改版了"
+                return parts
+            },
+        },
+        {
+            title: "更新",
+            type: "multiPartPage",
+            load: async () => {
+                const doc = new HtmlDocument(await this.getHtml("/custom/update"))
+                return [{ title: "最新更新", comics: this.parseCards(doc) }]
+            },
+        },
+        {
+            title: "排行",
+            type: "multiPartPage",
+            load: async () => {
+                const doc = new HtmlDocument(await this.getHtml("/custom/top"))
+                return [{ title: "热门排行", comics: this.parseCards(doc) }]
+            },
+        },
+    ]
+
+    /* ============================ 分类 ============================ */
+
     category = {
-        /// title of the category page, used to identify the page, it should be unique
         title: "漫画1234",
         parts: [
             {
                 name: "题材",
                 type: "fixed",
                 categories: [
-                    "全部", "少年热血", "武侠格斗", "科幻魔幻", "竞技体育", "爆笑喜剧", "侦探推理", "恐怖灵异", "耽美人生",
-                    "少女爱情", "恋爱生活", "生活漫画", "战争漫画", "故事漫画", "其他漫画", "爱情", "唯美", "武侠", "玄幻",
-                    "后宫", "治愈", "励志", "古风", "校园", "虐心", "魔幻", "冒险", "欢乐向", "节操", "悬疑", "历史", "职场",
-                    "神鬼", "明星", "穿越", "百合", "西方魔幻", "纯爱", "音乐舞蹈", "轻小说", "侦探", "伪娘", "仙侠", "四格",
-                    "剧情", "萌系", "东方", "性转换", "宅系", "美食", "脑洞", "惊险", "爆笑", "都市", "蔷薇", "恋爱", "格斗",
-                    "科幻", "魔法", "奇幻", "热血", "其他", "搞笑", "生活", "恐怖", "架空", "竞技", "战争", "搞笑喜剧", "青春",
-                    "浪漫", "爽流", "神话", "轻松", "日常", "家庭", "婚姻", "动作", "战斗", "异能", "内涵", "同人", "惊奇",
-                    "正剧", "推理", "宠物", "温馨", "异世界", "颜艺", "惊悚", "舰娘","机战", "彩虹", "耽美", "轻松搞笑",
-                    "修真恋爱架空", "复仇", "霸总", "段子", "逆袭", "烧脑", "娱乐圈", "纠结", "感动", "豪门", "体育", "机甲",
-                    "末世", "灵异", "僵尸", "宫廷", "权谋", "未来", "科技", "商战", "乡村", "震撼", "游戏", "重口味", "血腥",
-                    "逗比", "丧尸", "神魔", "修真", "社会", "召唤兽", "装逼", "新作", "漫改", "真人", "运动", "高智商", "悬疑推理",
-                    "机智", "史诗", "萝莉", "宫斗", "御姐", "恶搞", "精品", "日更", "小说改编", "防疫", "吸血", "暗黑", "总裁",
-                    "重生", "大女主", "系统", "神仙", "末日", "怪物", "妖怪", "修仙", "宅斗", "神豪", "高甜", "电竞", "豪快",
-                    "猎奇", "多世界", "性转", "少女", "改编", "女生", "乙女", "男生", "兄弟情", "智斗", "少男", "连载", "奇幻冒险",
-                    "古风穿越", "浪漫爱情", "古装", "幽默搞笑", "偶像", "小僵尸", "BL", "少年", "橘味", "情感", "经典",
-                    "腹黑", "都市大女主", "致郁", "美少女", "少儿", "暖萌", "长条", "限制级", "知音漫客", "氪金", "独家",
-                    "亲情", "现代", "武侠仙侠", "西幻", "超级英雄", "女神", "幻想", "欧风", "养成", "动作冒险", "GL", "橘调",
-                    "悬疑灵异", "古代宫廷", "欧式宫廷", "游戏竞技", "橘系", "奇幻爱情", "架空世界", "ゆり", "福瑞", "秀吉", "现代言情",
-                    "古代言情", "豪门总裁", "现言萌宝", "玄幻言情", "虐渣", "团宠", "古言萌宝", "现言甜宠", "古言脑洞", "AA", "金手指",
-                    "玄幻脑洞", "都市脑洞", "甜宠", "伦理", "生存", "TL", "悬疑脑洞", "黑暗", "独特", "成长", "幻想言情", "直播",
-                    "游戏体育", "现言脑洞", "音乐", "双男主", "迪化", "LGBTQ+", "正能量", "军事", "ABO", "悬疑恐怖",
-                    "玄幻科幻", "投稿", "种田", "经营", "反套路", "无节操", "强强", "克苏鲁", "无敌流", "冒险热血", "畅销",
-                    "大人系", "宅向", "萌娃", "宠兽", "异形", "撒糖", "诡异", "言情", "西方", "滑稽搞笑", "同居", "人外",
-                    "白切黑", "并肩作战", "救赎", "戏精", "美强惨", "非人类", "原创", "黑白漫", "无限流",
-                    "升级", "爽", "轻橘", "女帝", "偏执", "自由", "星际", "可盐可甜", "反差萌", "聪颖", "智商在线",
-                    "倔强", "狼人", "欢喜冤家", "吸血鬼", "萌宠", "学校", "台湾作品", "彩色", "武术", "短篇", "契约", "魔王",
-                    "无敌", "美女", "暧昧", "网游", "宅男", "追逐梦想", "冒险奇幻", "疯批", "中二", "召唤", "法宝", "钓系", "鬼怪",
-                    "占有欲", "阳光", "元气", "强制爱", "黑道", "马甲", "阴郁", "忧郁", "哲理", "病娇", "喜剧", "江湖恩怨",
-                    "相爱相杀", "萌", "SM", "精选", "生子", "年下", "18+限制", "日久生情", "梦想", "多攻", "竹马", "骨科", "gnbq"
-                  ],
-                itemType: "category",
-                categoryParams: [
-                    "", "shaonianrexue", "wuxiagedou", "kehuanmohuan", "jingjitiyu", "baoxiaoxiju", "zhentantuili", "kongbulingyi",
-                    "danmeirensheng", "shaonvaiqing", "lianaishenghuo", "shenghuomanhua", "zhanzhengmanhua", "gushimanhua",
-                    "qitamanhua", "aiqing", "weimei", "wuxia", "xuanhuan", "hougong", "zhiyu", "lizhi", "gufeng", "xiaoyuan", "nuexin",
-                    "mohuan", "maoxian", "huanlexiang", "jiecao", "xuanyi", "lishi", "zhichang", "shengui", "mingxing", "chuanyue",
-                    "baihe", "xifangmohuan", "chunai", "yinyuewudao", "qingxiaoshuo", "zhentan", "weiniang", "xianxia", "sige", "juqing",
-                    "mengxi", "dongfang", "xingzhuanhuan", "zhaixi", "meishi", "naodong", "jingxian", "baoxiao", "dushi", "qiangwei",
-                    "lianai", "gedou", "kehuan", "mofa", "qihuan", "rexue", "qita", "gaoxiao", "shenghuo", "kongbu", "jiakong", "jingji",
-                    "zhanzheng", "gaoxiaoxiju", "qingchun", "langman", "shuangliu", "shenhua", "qingsong", "richang", "jiating", "hunyin",
-                    "dongzuo", "zhandou", "yineng", "neihan", "tongren", "jingqi", "zhengju", "tuili", "chongwu", "wenxin", "yishijie",
-                    "yanyi", "jingsong", "jianniang", "jizhan", "caihong", "danmei", "qingsonggaoxiao", "xiuzhenlianaijiakong", "fuchou",
-                    "bazong", "duanzi", "nixi", "shaonao", "yulequan", "jiujie", "gandong", "haomen", "tiyu", "jijia", "moshi", "lingyi",
-                    "jiangshi", "gongting", "quanmou", "weilai", "keji", "shangzhan", "xiangcun", "zhenhan", "youxi",
-                    "zhongkouwei", "xuexing", "doubi", "sangshi", "shenmo", "xiuzhen", "shehui", "zhaohuanshou", "zhuangbi",
-                    "xinzuo", "mangai", "zhenren", "yundong", "gaozhishang", "xuanyituili", "jizhi", "shishi", "luoli","gongdou",
-                    "yujie", "egao", "jingpin", "rigeng", "xiaoshuogaibian", "fangyi", "xixie", "anhei", "zongcai", "zhongsheng",
-                    "danvzhu", "xitong", "shenxian", "mori", "guaiwu", "yaoguai", "xiuxian", "zhaidou", "shenhao", "gaotian",
-                    "dianjing", "haokuai", "lieqi", "duoshijie", "xingzhuan", "shaonv", "gaibian", "nvsheng", "yinv", "nansheng",
-                    "xiongdiqing", "zhidou", "shaonan", "lianzai", "qihuanmaoxian", "gufengchuanyue", "langmanaiqing", "guzhuang",
-                    "youmogaoxiao", "ouxiang", "xiaojiangshi", "BL", "shaonian", "juwei", "qinggan", "jingdian",
-                    "fuhei", "dushidanvzhu", "zhiyu2", "meishaonv", "shaoer", "nuanmeng", "changtiao", "xianzhiji", "zhiyinmanke",
-                    "kejin", "dujia", "qinqing", "xiandai", "wuxiaxianxia", "xihuan", "chaojiyingxiong", "nvshen", "huanxiang",
-                    "oufeng", "yangcheng", "dongzuomaoxian", "GL", "judiao", "xuanyilingyi", "gudaigongting", "oushigongting",
-                    "youxijingji", "juxi", "qihuanaiqing", "jiakongshijie", "unknown", "furui", "xiuji", "xiandaiyanqing", "gudaiyanqing",
-                    "haomenzongcai", "xianyanmengbao", "xuanhuanyanqing", "nuezha", "tuanchong", "guyanmengbao", "xianyantianchong",
-                    "guyannaodong", "AA", "jinshouzhi", "xuanhuannaodong", "dushinaodong", "tianchong", "lunli", "shengcun", "TL",
-                    "xuanyinaodong", "heian", "dute", "chengzhang", "huanxiangyanqing", "zhibo", "youxitiyu", "xianyannaodong",
-                    "yinyue", "shuangnanzhu", "dihua", "LGBTQ", "zhengnengliang", "junshi", "ABO", "xuanyikongbu", "xuanhuankehuan", "tougao",
-                    "zhongtian", "jingying", "fantaolu", "wujiecao", "qiangqiang", "kesulu", "wudiliu", "maoxianrexue", "changxiao",
-                    "darenxi", "zhaixiang", "mengwa", "chongshou", "yixing", "satang", "guiyi", "yanqing", "xifang", "huajigaoxiao", "tongju",
-                    "renwai", "baiqiehei", "bingjianzuozhan", "jiushu", "xijing", "meiqiangcan", "feirenlei", "yuanchuang", "heibaiman",
-                    "wuxianliu", "shengji", "shuang", "qingju", "nvdi", "pianzhi", "ziyou", "xingji", "keyanketian", "fanchameng", "congying",
-                    "zhishangzaixian", "juejiang", "langren", "huanxiyuanjia", "xixiegui", "mengchong", "xuexiao", "taiwanzuopin", "caise",
-                    "wushu", "duanpian", "qiyue", "mowang", "wudi", "meinv", "aimei", "wangyou", "zhainan", "zhuizhumengxiang", "maoxianqihuan",
-                    "fengpi", "zhonger", "zhaohuan", "fabao", "diaoxi", "guiguai", "zhanyouyu", "yangguang", "yuanqi", "qiangzhiai", "heidao",
-                    "majia", "yinyu", "youyu", "zheli", "bingjiao", "xiju", "jianghuenyuan", "xiangaixiangsha", "meng", "SM", "jingxuan", "shengzi",
-                    "nianxia", "18xianzhi", "rijiushengqing", "mengxiang", "duogong", "zhuma", "guke", "gnbq"
+                    "全部", "恋爱", "搞笑", "日漫", "其他", "热血", "都市", "国漫", "少女", "科幻",
+                    "魔幻", "奇幻", "冒险", "生活", "韩漫", "纯爱", "少年", "校园", "耽美", "古风",
+                    "剧情", "喜剧", "日常", "悬疑", "玄幻", "格斗", "穿越", "恐怖", "武侠", "灵异",
+                    "大女主", "百合", "推理", "战斗", "治愈", "侦探", "竞技", "重生", "系统", "逆袭",
+                    "短篇", "浪漫", "职场", "动作", "魔法", "后宫", "ABO", "体育", "青春", "总裁",
+                    "霸总", "复仇", "架空", "西幻", "现代", "宫廷", "异能", "欧风", "神鬼", "蔷薇",
+                    "美食", "欢乐向", "欧美", "唯美", "四格", "女神", "励志", "故事漫画", "战争", "脑洞",
+                    "修真", "社会", "萌系", "高甜", "妖怪", "年下", "修仙", "轻小说", "末日", "怪物",
+                    "历史", "改编", "游戏", "神仙", "神魔", "惊悚", "娱乐圈", "东方", "轻松", "权谋",
+                    "宫斗", "同人", "多攻", "明星", "音乐", "仙侠", "机甲", "偶像", "虐心", "正能量",
                 ],
-            }
+                categoryParams: [
+                    "0", "17", "13", "240", "97", "6", "31", "257", "187", "8",
+                    "69", "96", "7", "29", "209", "77", "204", "11", "16", "28",
+                    "84", "380", "104", "18", "10", "94", "14", "19", "66", "26",
+                    "172", "27", "112", "107", "67", "80", "23", "171", "173", "126",
+                    "354", "100", "73", "21", "95", "15", "285", "132", "99", "170",
+                    "9", "124", "25", "224", "222", "136", "108", "228", "74", "93",
+                    "89", "70", "258", "65", "83", "226", "24", "60", "20", "90",
+                    "12", "150", "85", "181", "177", "387", "178", "79", "175", "176",
+                    "72", "188", "143", "174", "149", "117", "128", "86", "103", "137",
+                    "161", "22", "391", "75", "278", "82", "133", "201", "68", "283",
+                ],
+                itemType: "category",
+            },
         ],
-        // enable ranking page
         enableRankingPage: false,
     }
 
-    parseComics(html, onePage = false) {
-        const doc = new HtmlDocument(html);
-        const comics = [];
-        for (let comic of doc.querySelectorAll(".itemBox")) {
-            comics.push(new Comic({
-                id: comic.attributes["data-key"],
-                title: comic.querySelector(".title").text,
-                cover: comic.querySelector("img").attributes["src"]
-            }));
-        }
-        return {comics: comics, maxPage: onePage ? 1 : parseInt(doc.querySelector("#total-page").attributes["value"])};
-    }
-
-    parseList(doc) {
-        const comics = [];
-        for (let comic of doc.querySelectorAll(".list-comic")) {
-            comics.push(new Comic({
-                id: comic.attributes["data-key"],
-                title: comic.querySelector(".txtA").text,
-                cover: comic.querySelector("img").attributes["src"]
-            }));
-        }
-        return comics;
-    }
-
-    /// category comic loading related
     categoryComics = {
-        load: async (category, params, options, page) => {
-            if (params.endsWith(".html")) {
-                const res = await Network.get(`${this.baseUrl}${params}`);
-                if (res.status !== 200) {
-                    throw `Invalid status code: ${res.status}`;
-                }
-                return this.parseComics(res.body, true);
-            } else {
-                const res = await Network.get(`${this.baseUrl}/list/?filter=${params}-${options[0]}-${options[1]}-${options[2]}&sort=${options[3]}&page=${page}`);
-                console.warn(`${this.baseUrl}/list/?filter=${params}-${options[0]}-${options[1]}-${options[2]}&sort=${options[3]}&page=${page}`)
-                if (res.status !== 200) {
-                    throw `Invalid status code: ${res.status}`;
-                }
-                const doc = new HtmlDocument(res.body);
-                return {comics: this.parseList(doc),
-                    maxPage: parseInt(doc.querySelector("#total-page").attributes["value"])};
+        load: async (category, param, options, page) => {
+            const tag = param == null ? "0" : String(param)
+            let finish = "0"
+            let order = "hits"
+            if (options != null) {
+                if (options[0] != null && String(options[0]).length > 0) finish = String(options[0])
+                if (options[1] != null && String(options[1]).length > 0) order = String(options[1])
+            }
+
+            // /category/tags/0 这种写法会返回 0 条，没选题材时必须省略 tags 段
+            let path = "/category"
+            if (tag !== "0" && tag !== "") path += "/tags/" + tag
+            if (finish !== "0" && finish !== "") path += "/finish/" + finish
+            path += "/order/" + order
+            if (page > 1) path += "/page/" + page
+
+            const doc = new HtmlDocument(await this.getHtml(path))
+            const grid = doc.querySelector("#comicGrid") || doc.querySelector(".comic-grid")
+            return {
+                comics: this.parseCards(grid),
+                maxPage: this.maxPageOf(doc),
             }
         },
-        optionLoader: async (category, params) => {
-            if (!params.endsWith(".html")) {
-                return [
-                    {
-                        options: [
-                            "-全部",
-                            "ertong-儿童漫画",
-                            "shaonian-少年漫画",
-                            "shaonv-少女漫画",
-                            "qingnian-青年漫画",
-                            "bailingmanhua-白领漫画",
-                            "tongrenmanhua-同人漫画"
-                        ]
-                    },
-                    {
-                        options: [
-                            "-全部",
-                            "wanjie-已完结",
-                            "lianzai-连载中",
-                        ]
-                    },
-                    {
-                        options: [
-                            "-全部",
-                            "rhmh-日韩",
-                            "dlmh-大陆",
-                            "gtmh-港台",
-                            "taiwan-台湾",
-                            "ommh-欧美",
-                            "hanguo-韩国",
-                            "qtmg-其他",
-                        ]
-                    },
-                    {
-                        options: [
-                            "update-更新",
-                            "post-发布",
-                            "click-点击",
-                        ]
-                    },
-                ];
-            }
-            return [];
-        }
-    }
 
-    /// search related
-    search = {
-        load: async (keyword, options, page) => {
-            const res = await Network.get(`${this.baseUrl}/search/?keywords=${keyword}&sort=${options[0]}&page=${page}`);
-            if (res.status !== 200) {
-                throw `Invalid status code: ${res.status}`;
-            }
-            return this.parseComics(res.body);
-        },
-
-        // provide options for search
         optionList: [
             {
-                options: [
-                    "update-更新",
-                    "post-发布",
-                    "click-点击",
-                ],
-                label: "排序"
-            }
+                type: "select",
+                options: ["0-全部", "1-连载", "2-完结"],
+                label: "状态",
+                default: "0",
+            },
+            {
+                type: "select",
+                options: ["hits-热门", "id-最新", "addtime-更新"],
+                label: "排序",
+                default: "hits",
+            },
         ],
+    }
 
-        // enable tags suggestions
+    /* ============================ 搜索 ============================ */
+
+    search = {
+        load: async (keyword, options, page) => {
+            const kw = (keyword == null ? "" : keyword).trim()
+            if (kw.length === 0) return { comics: [], maxPage: 1 }
+
+            let path = "/search/" + encodeURIComponent(kw)
+            if (page > 1) path += "/" + page
+
+            const doc = new HtmlDocument(await this.getHtml(path))
+            // 搜索页里第一个 .comic-grid 才是结果，后面还有「推荐漫画」，不能一起解析
+            const grid = doc.querySelector(".comic-grid")
+            const comics = this.parseCards(grid)
+            return {
+                comics: comics,
+                maxPage: comics.length === 0 ? 1 : this.maxPageOf(doc),
+            }
+        },
+
+        optionList: [],
+
         enableTagsSuggestions: false,
     }
 
-    /// single comic related
+    /* ============================ 详情与阅读 ============================ */
+
     comic = {
         loadInfo: async (id) => {
-            const res = await Network.get(`${this.baseUrl}/comic/${id}.html`);
-            if (res.status !== 200) {
-                throw `Invalid status code: ${res.status}`;
-            }
-            const doc = new HtmlDocument(res.body);
-            const title = doc.querySelector(".BarTit").text;
-            const cover = doc.querySelector(".pic").querySelector("img").attributes["src"];
-            const description = doc.querySelector("#full-des")?.text;
-            const infos = doc.querySelectorAll(".txtItme");
-            const tags = [];
-            for (let tag of doc.querySelector(".sub_r").querySelectorAll("a")) {
-                const tag_name = tag.text;
-                if (tag_name.length > 0) {
-                    tags.push(tag_name);
+            const doc = new HtmlDocument(await this.getHtml("/comic/" + id + ".html"))
+
+            const titleEl = doc.querySelector("#mintWorkTitle")
+            const coverEl = doc.querySelector("#mintWorkCover")
+            const title = this.textOf(titleEl) || this.textOf(doc.querySelector("h1"))
+            const cover = this.coverOf(coverEl)
+
+            let author = ""
+            let status = ""
+            let updateTime = ""
+            let readCount = ""
+            const tagList = []
+
+            const info = doc.querySelector(".mint-work-info")
+            if (info != null) {
+                const ps = info.querySelectorAll("p")
+                if (ps.length > 0) {
+                    author = this.textOf(ps[0]).replace(/\s*著\s*$/, "").trim()
+                }
+                if (ps.length > 1) {
+                    const tagEl = ps[1].querySelector(".mint-tag")
+                    status = this.textOf(tagEl)
+                    let line = this.textOf(ps[1])
+                    if (status.length > 0) line = line.replace(status, "")
+                    for (const t of line.split(/[\s,，、\/]+/)) {
+                        if (t.length > 0 && t !== status) tagList.push(t)
+                    }
+                }
+                if (ps.length > 2) {
+                    const meta = this.textOf(ps[2])
+                    const m = meta.match(/(\d{2}-\d{2})\s*更新/) || meta.match(/更新[：:]\s*([^\s]+)/)
+                    if (m != null) updateTime = m[1]
+                    const r = meta.match(/([\d.]+[万wW]?)\s*阅读/)
+                    if (r != null) readCount = r[1]
                 }
             }
-            const chapters = {};
-            const chapterElements = doc.querySelector(".chapter-warp")?.querySelectorAll("li");
-            if (chapterElements) {
-                for (let ch of chapterElements) {
-                    const id = ch.querySelector("a").attributes["href"].replace("/comic/", "").replace(".html", "").split("/").join("_");
-                    chapters[id] = ch.querySelector("span").text;
-                }
+
+            // 简介
+            let description = ""
+            const intro = doc.querySelector("#mintIntroPanel")
+            if (intro != null) {
+                const body = intro.querySelector("div") || intro.querySelector("p")
+                description = this.textOf(body)
             }
-            return {
+
+            // 章节：站点默认倒序（最新在前），这里翻正，方便从头读
+            const items = []
+            for (const a of doc.querySelectorAll(".mint-chapter-grid a")) {
+                let epId = this.attrsOf(a, "data-chapter-id")
+                if (epId.length === 0) {
+                    const m = this.attrsOf(a, "href").match(/\/(\d+)\.html/)
+                    epId = m == null ? "" : m[1]
+                }
+                const name = this.textOf(a)
+                if (epId.length > 0 && name.length > 0) items.push([epId, name])
+            }
+            items.reverse()
+            const chapters = new Map()
+            for (const it of items) chapters.set(it[0], it[1])
+
+            const tags = {}
+            if (author.length > 0) tags["作者"] = [author]
+            if (status.length > 0) tags["状态"] = [status]
+            if (tagList.length > 0) tags["标签"] = tagList
+            if (readCount.length > 0) tags["阅读"] = [readCount]
+            if (updateTime.length > 0) tags["更新"] = [updateTime]
+
+            return new ComicDetails({
                 title: title,
                 cover: cover,
                 description: description,
-                tags: {
-                    "作者": [infos[0].text.replaceAll("\n", "").replaceAll("\r", "").trim()],
-                    "更新": [infos[3].querySelector(".date").text],
-                    "标签": tags.slice(0,-1)
-                },
+                tags: tags,
                 chapters: chapters,
-                recommend: this.parseList(doc)
-            };
-
+                recommend: this.parseCoverCards(doc, id),
+                url: this.baseUrl + "/comic/" + id + ".html",
+                updateTime: updateTime,
+            })
         },
 
         loadEp: async (comicId, epId) => {
-            const ids = epId.split("_");
-            const res = await Network.get(`${this.baseUrl}/comic/${ids[0]}/${ids[1]}.html`);
-            if (res.status !== 200) {
-                throw `Invalid status code: ${res.status}`;
+            let lastError = ""
+            // 阅读页域名不稳定，整条链路重来一次通常就能成功
+            for (let round = 0; round < 2; round++) {
+                // 1) 章节页：多数情况下 302 到 /go/{token} 中转页
+                const html0 = await this.getHtml("/comic/" + comicId + "/" + epId + ".html")
+
+                // 2) 中转页里没有图片，需要找出真正的阅读页地址
+                let html = html0
+                if (html0.indexOf("reader-image") < 0) {
+                    const target = this.extractRedirect(html0)
+                    if (target == null) {
+                        throw "无法获取该章节的阅读地址（可能已下架或需要登录）"
+                    }
+                    try {
+                        html = await this.getFull(target, this.baseUrl + "/")
+                    } catch (e) {
+                        lastError = String(e)
+                        continue
+                    }
+                }
+
+                const images = this.collectImages(new HtmlDocument(html), html)
+                if (images.length > 0) return { images: images }
+                lastError = "页面里没有找到图片"
             }
-            const html = res.body;
-            const start = html.search(`var chapterImages = `) + 22;
-            const end = html.search(`;var chapterPath = `) - 2;
-            const end2 = html.search(`;var chapterPrice`) - 1;
-            const images = html.substring(start, end).split(`","`);
-            const cpath = html.substring(end + 22, end2);
-            for (let i = 0; i < images.length; i++) {
-                images[i] = "https://gmh1234.wszwhg.net/" + cpath + images[i].replaceAll("\\", "");
-                images[i] = images[i].replaceAll("//", "/");
-            }
-            return { images };
+            throw "章节加载失败（" + lastError + "），再点一次重试即可"
         },
 
-        // enable tags translate
+        onImageLoad: (url, comicId, epId) => {
+            return {
+                headers: {
+                    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
+                    "Referer": this.baseUrl + "/",
+                },
+            }
+        },
+
+        idMatch: null,
+
+        link: {
+            domains: ["wmh1234.com", "m.wmh1234.com", "www.wmh1234.com"],
+            linkToId: (url) => {
+                const m = (url == null ? "" : url).match(/\/comic\/(\d+)/)
+                return m == null ? null : m[1]
+            },
+        },
+
         enableTagsTranslate: false,
+    }
+
+    /** 跳出中转页：meta refresh / location.replace / 裸链接 三种写法都兼容 */
+    extractRedirect(html) {
+        let m = html.match(/http-equiv=["']refresh["'][^>]*content=["'][^"']*url=([^"']+)["']/i)
+        if (m != null) return m[1].trim()
+        m = html.match(/location\.(?:replace|assign)\(\s*["']([^"']+)["']/)
+        if (m != null) return m[1]
+        m = html.match(/location\.href\s*=\s*["']([^"']+)["']/)
+        if (m != null) return m[1]
+        m = html.match(/https?:\/\/[^\s"'<>\\]*\/r\/[A-Za-z0-9_\-=]+/)
+        if (m != null) return m[0]
+        return null
+    }
+
+    /** 取章节图片：优先 img.reader-image，兜底扫全部 img，再兜底正则 */
+    collectImages(doc, html) {
+        const images = []
+        const seen = {}
+        const push = (u) => {
+            let url = this.absUrl(u)
+            if (url.length === 0) return
+            if (/placeholder|blank\.(gif|png)|loading\.(gif|svg)|\/images\/cover\//i.test(url)) return
+            if (seen[url] === true) return
+            seen[url] = true
+            images.push(url)
+        }
+
+        for (const img of doc.querySelectorAll("img.reader-image")) {
+            push(this.attrsOf(img, "data-src") || this.attrsOf(img, "src"))
+        }
+
+        if (images.length === 0) {
+            for (const img of doc.querySelectorAll("img")) {
+                const src = this.attrsOf(img, "data-src") || this.attrsOf(img, "data-original")
+                if (src.length > 0) push(src)
+            }
+        }
+
+        if (images.length === 0 && html != null) {
+            const re = /data-src=["'](https?:\/\/[^"']+\.(?:webp|jpe?g|png|avif)[^"']*)["']/gi
+            let m = re.exec(html)
+            while (m != null) {
+                push(m[1])
+                m = re.exec(html)
+            }
+        }
+
+        return images
+    }
+
+    /* ============================ 翻译 ============================ */
+
+    translation = {
+        "zh_CN": {
+            "站点域名": "站点域名",
+            "域名打不开时自动换备用域名": "域名打不开时自动换备用域名",
+        },
+        "zh_TW": {
+            "站点域名": "站點網域",
+            "域名打不开时自动换备用域名": "網域打不開時自動換備用網域",
+        },
+        "en": {
+            "站点域名": "Site domain",
+            "域名打不开时自动换备用域名": "Auto switch to backup domain",
+        },
     }
 }
