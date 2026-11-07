@@ -202,11 +202,11 @@
         "version": "1.1.0",
         "description": "mycomic.com漫画源, 遇到Cloudflare验证请在源设置中登录"
     },
-	{
+    {
         "name": "瓜子漫画",
         "fileName": "guazimanhua.js",
         "key": "guazimanhua",
         "version": "1.0.4",
-		"description": "瓜瓜瓜瓜瓜...子漫画"
+        "description": "瓜瓜瓜瓜瓜...子漫画"
     }
 ]
